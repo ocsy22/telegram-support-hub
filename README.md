@@ -16,6 +16,34 @@ setup=$(mktemp) && wget -O "$setup" https://raw.githubusercontent.com/ocsy22/tel
 
 升级已有安装并重新设置后台账号时，在命令末尾给脚本传入公网 IP 和 `--configure-admin`。已有机器人的 Token 和欢迎语会保留。在后台为每个已有 Bot 填写客服超级群并保存，轮询才会恢复。
 
+## 一键卸载
+
+在 Ubuntu 的 root 终端粘贴整个命令块。它会停止客服服务、取消开机自启并移除程序。如果部署时启用了域名访问，也会移除本项目的 Caddy 配置并重新加载 Caddy。
+
+```bash
+bash <<'UNINSTALL'
+set -e
+unit=telegram-support-hub.service
+if systemctl cat "$unit" >/dev/null 2>&1; then
+  systemctl disable --now "$unit"
+fi
+rm -f -- "/etc/systemd/system/$unit" \
+  "/etc/systemd/system/$unit.d/90-deploy-bind.conf" \
+  /opt/telegram-support-hub/app.py
+systemctl daemon-reload
+site=/etc/caddy/telegram-support-hub.caddy
+if [ -f /etc/caddy/Caddyfile ] && grep -Fxq "import $site" /etc/caddy/Caddyfile; then
+  sed -i '\|^import /etc/caddy/telegram-support-hub\.caddy$|d' /etc/caddy/Caddyfile
+  if systemctl is-active --quiet caddy; then
+    systemctl reload caddy
+  fi
+fi
+rm -f -- "$site"
+UNINSTALL
+```
+
+卸载会保留管理员账号、Bot 配置、话题映射和日志，重装时可以继续使用。
+
 ## 接入客服超级群
 
 1. 在 Telegram 创建超级群并开启「话题」。把机器人设为管理员，授予「管理话题」权限。
