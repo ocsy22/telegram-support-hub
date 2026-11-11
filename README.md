@@ -4,7 +4,7 @@
 
 ## Ubuntu 一键部署
 
-先把后台域名的 DNS 记录指向 VPS，并放行公网 TCP 80 和 443。使用支持 systemd 的 Ubuntu。Caddy 自动申请 HTTPS 证书，后台使用安装时生成的管理员密码。
+使用支持 systemd 的 Ubuntu。通过公网 IPv4 访问时，放行 TCP 8765。HTTP 会明文传输管理员密码和 Bot Token，请将 8765 的入站来源限制为管理端 IP。使用域名时，先把 DNS 记录指向 VPS 并放行 TCP 80 和 443，Caddy 会自动申请 HTTPS 证书。
 
 在 Ubuntu 的 root 终端粘贴这一条命令：
 
@@ -12,7 +12,7 @@
 wget -qO /tmp/telegram-support-deploy.sh https://raw.githubusercontent.com/ocsy22/telegram-support-hub/main/deploy.sh && bash /tmp/telegram-support-deploy.sh
 ```
 
-按提示填写后台域名。也可以在命令末尾指定域名，例如 `bash /tmp/telegram-support-deploy.sh support.example.com`。部署检查通过后，终端会输出 HTTPS 地址、用户名 `admin` 和密码。重复部署会保留现有数据库和密码。
+按提示填写 VPS 公网 IPv4 或后台域名。IPv4 模式会输出 `http://公网IP:8765/`。也可以在命令末尾指定域名，例如 `bash /tmp/telegram-support-deploy.sh support.example.com`。部署检查通过后，终端会输出后台地址、用户名 `admin` 和密码。重复部署会保留现有数据库和密码。
 
 若 VPS 已有站点，请确认 Caddy 可以监听 80 和 443，且后台域名未被其他站点占用。已有反向代理的服务器也可运行 `sudo bash install.sh`，然后将该域名的 HTTPS 流量转发至 `127.0.0.1:8765`。
 

@@ -300,7 +300,8 @@ def main():
     if len(password) < 16:
         raise SystemExit("ADMIN_PASSWORD must contain at least 16 characters")
     init()
-    server = ThreadingHTTPServer(("127.0.0.1", int(os.environ.get("PORT", "8765"))), Admin)
+    bind_host = os.environ.get("BIND_HOST", "127.0.0.1")
+    server = ThreadingHTTPServer((bind_host, int(os.environ.get("PORT", "8765"))), Admin)
     server.credentials = b"Basic " + base64.b64encode(f"admin:{password}".encode())
     threading.Thread(target=supervise, daemon=True).start()
     server.serve_forever()
