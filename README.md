@@ -2,23 +2,19 @@
 
 一个网页后台管理多个 Telegram Bot，每个 Bot 可配置多名客服、欢迎语和启用状态。客户私聊 Bot 后，文字和常见媒体会复制给该 Bot 的所有客服。任一客服在 Telegram 内回复那条消息，Bot 会把回复发回对应客户。多位客服可以同时回复同一个客户。
 
-## Ubuntu 安装
+## Ubuntu 一键部署
 
-将本目录上传到 Ubuntu，进入目录后运行：
+先把后台域名的 DNS 记录指向 VPS，并放行公网 TCP 80 和 443。使用支持 systemd 的 Ubuntu。Caddy 自动申请 HTTPS 证书，后台使用安装时生成的管理员密码。
 
-```bash
-sudo bash install.sh
-```
-
-需要 Ubuntu（systemd、Python 3.10+）及到 Telegram Bot API 的 HTTPS 网络。重复运行安装命令会更新程序并保留数据库和管理员密码。服务开机自启。
-
-从自己的电脑连接后台：
+在 Ubuntu 的 root 终端粘贴这一条命令：
 
 ```bash
-ssh -N -L 8765:127.0.0.1:8765 用户名@服务器地址
+wget -qO /tmp/telegram-support-deploy.sh https://raw.githubusercontent.com/ocsy22/telegram-support-hub/main/deploy.sh && bash /tmp/telegram-support-deploy.sh
 ```
 
-保持 SSH 连接，在浏览器打开 http://127.0.0.1:8765/ 。用户名为 `admin`，在服务器执行 `sudo cat /etc/telegram-support-hub/service.env` 查看密码。后台只监听 Ubuntu 的本地回环地址。若要直接通过域名访问，可在服务器上使用 HTTPS 反向代理。
+按提示填写后台域名。也可以在命令末尾指定域名，例如 `bash /tmp/telegram-support-deploy.sh support.example.com`。部署检查通过后，终端会输出 HTTPS 地址、用户名 `admin` 和密码。重复部署会保留现有数据库和密码。
+
+若 VPS 已有站点，请确认 Caddy 可以监听 80 和 443，且后台域名未被其他站点占用。已有反向代理的服务器也可运行 `sudo bash install.sh`，然后将该域名的 HTTPS 流量转发至 `127.0.0.1:8765`。
 
 ## 配置 Bot 和客服
 
