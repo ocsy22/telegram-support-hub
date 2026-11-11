@@ -32,7 +32,7 @@ fi
 
 work=$(mktemp -d)
 trap 'rm -f -- "$work/app.py" "$work/install.sh" "$work/site.caddy"; rmdir -- "$work"' EXIT
-source_url=https://raw.githubusercontent.com/ocsy22/telegram-support-hub/main
+source_url=https://raw.githubusercontent.com/ocsy22/telegram-support-hub/${SUPPORT_REF:-main}
 for file in app.py install.sh; do
   curl -fsSL --retry 3 "$source_url/$file" -o "$work/$file"
 done
@@ -43,11 +43,12 @@ if (( direct_ip )); then
 else
   rm -f -- "$override"
 fi
-bash "$work/install.sh"
+bash "$work/install.sh" "${2:-}"
+admin_user=$(sed -n 's/^ADMIN_USERNAME=//p' /etc/telegram-support-hub/service.env)
+admin_user=${admin_user:-admin}
 
 if (( direct_ip )); then
-  printf '\n后台地址 http://%s:8765/\n用户名 admin\n' "$address"
-  cat /etc/telegram-support-hub/service.env
+  printf '\n后台地址 http://%s:8765/\n用户名 %s\n' "$address" "$admin_user"
   printf '请在 VPS 防火墙和云安全组放行 TCP 8765。HTTP 登录和 Bot Token 配置均为明文传输，建议仅允许管理端 IP 访问。\n'
   exit 0
 fi
@@ -67,8 +68,7 @@ url="https://$address/"
 for attempt in {1..24}; do
   status=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 3 "$url" 2>/dev/null || true)
   if [[ "$status" == 401 ]]; then
-    printf '\n后台地址 %s\n用户名 admin\n' "$url"
-    cat /etc/telegram-support-hub/service.env
+    printf '\n后台地址 %s\n用户名 %s\n' "$url" "$admin_user"
     exit 0
   fi
   sleep 5

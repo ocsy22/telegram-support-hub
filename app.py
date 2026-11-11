@@ -40,12 +40,16 @@ def init():
                 agents TEXT NOT NULL, welcome TEXT NOT NULL, enabled INTEGER NOT NULL,
                 offset INTEGER NOT NULL DEFAULT 0
             );
-            CREATE TABLE IF NOT EXISTS routes (
-                bot INTEGER NOT NULL, agent INTEGER NOT NULL,
-                message INTEGER NOT NULL, customer INTEGER NOT NULL,
-                PRIMARY KEY (bot, agent, message)
+            CREATE TABLE IF NOT EXISTS topics (
+                bot INTEGER NOT NULL, chat INTEGER NOT NULL, customer INTEGER NOT NULL,
+                thread INTEGER NOT NULL,
+                PRIMARY KEY (bot, chat, customer), UNIQUE (bot, chat, thread)
             );
         """)
+        conn.execute("BEGIN IMMEDIATE")
+        columns = {column["name"] for column in conn.execute("PRAGMA table_info(bots)")}
+        if "support_group" not in columns:
+            conn.execute("ALTER TABLE bots ADD COLUMN support_group INTEGER")
 
 
 class TelegramError(Exception):
@@ -69,49 +73,59 @@ def api(token, method, **data):
 
 def relay(bot, message):
     chat = message["chat"]
-    if chat["type"] != "private":
+    group = bot["support_group"]
+    if not group:
         return
     token = bot["token"]
-    sender = chat["id"]
-    agents = json.loads(bot["agents"])
-    body = message.get("text", "")
-    if body == "/start":
-        text = "请直接回复机器人转来的客户消息。" if sender in agents else bot["welcome"]
-        api(token, "sendMessage", chat_id=sender, text=text)
-        return
-    if not FORMAT.intersection(message):
-        api(token, "sendMessage", chat_id=sender, text="暂不支持此消息类型，请发送文字或常见附件。")
-        return
-    copy = {"from_chat_id": sender, "message_id": message["message_id"]}
-    if sender in agents:
-        reply = message.get("reply_to_message", {}).get("message_id")
-        with db() as conn:
-            route = conn.execute(
-                "SELECT customer FROM routes WHERE bot=? AND agent=? AND message=?",
-                (bot["id"], sender, reply),
-            ).fetchone()
-        if not route:
-            api(token, "sendMessage", chat_id=sender, text="请使用 Telegram 的回复功能，回复客户原消息。")
+    source = chat["id"]
+    if chat["type"] == "private":
+        if message.get("text") == "/start":
+            api(token, "sendMessage", chat_id=source, text=bot["welcome"])
+            return
+        if not FORMAT.intersection(message):
+            api(token, "sendMessage", chat_id=source, text="请发送文字或常见附件。")
             return
         try:
-            api(token, "copyMessage", chat_id=route["customer"], **copy)
+            with db() as conn:
+                topic = conn.execute("SELECT thread FROM topics WHERE bot=? AND chat=? AND customer=?",
+                                     (bot["id"], group, source)).fetchone()
+            if topic:
+                thread = topic["thread"]
+            else:
+                name = message.get("from", {}).get("first_name") or "客户"
+                title = f'{bot["username"]} · {name} · {source}'[:128]
+                thread = api(token, "createForumTopic", chat_id=group, name=title)["message_thread_id"]
+                with db() as conn:
+                    conn.execute("INSERT INTO topics VALUES (?, ?, ?, ?)",
+                                 (bot["id"], group, source, thread))
+            api(token, "copyMessage", chat_id=group, message_thread_id=thread,
+                from_chat_id=source, message_id=message["message_id"])
         except TelegramError:
-            api(token, "sendMessage", chat_id=sender, text="回复发送失败，请稍后重试。")
+            api(token, "sendMessage", chat_id=source, text="客服暂时无法接收消息，请稍后重试。")
+            return
         return
 
-    delivered = False
-    for agent in agents:
-        try:
-            result = api(token, "copyMessage", chat_id=agent, **copy)
-        except TelegramError:
-            logging.warning("Bot %s could not deliver to agent %s", bot["id"], agent)
-            continue
-        with db() as conn:
-            conn.execute("INSERT OR REPLACE INTO routes VALUES (?, ?, ?, ?)",
-                         (bot["id"], agent, result["message_id"], sender))
-        delivered = True
-    if not delivered:
-        api(token, "sendMessage", chat_id=sender, text="客服暂时无法接收消息，请稍后重试。")
+    if chat["type"] != "supergroup" or source != group:
+        return
+    sender = message.get("from", {})
+    if sender.get("is_bot") or sender.get("id") not in json.loads(bot["agents"]):
+        return
+    thread = message.get("message_thread_id")
+    if not thread or not FORMAT.intersection(message):
+        return
+    with db() as conn:
+        route = conn.execute(
+            "SELECT customer FROM topics WHERE bot=? AND chat=? AND thread=?",
+            (bot["id"], group, thread),
+        ).fetchone()
+    if not route:
+        return
+    try:
+        api(token, "copyMessage", chat_id=route["customer"], from_chat_id=group,
+            message_id=message["message_id"])
+    except TelegramError:
+        api(token, "sendMessage", chat_id=group, text="回复发送失败，客户可能已屏蔽机器人。",
+            reply_parameters={"message_id": message["message_id"]})
 
 
 def get_bot(bot_id):
@@ -148,7 +162,9 @@ def supervise():
     workers = {}
     while True:
         with db() as conn:
-            ids = [row["id"] for row in conn.execute("SELECT id FROM bots WHERE enabled=1")]
+            ids = [row["id"] for row in conn.execute(
+                "SELECT id FROM bots WHERE enabled=1 AND support_group IS NOT NULL"
+            )]
         workers = {key: worker for key, worker in workers.items() if worker.is_alive()}
         for bot_id in ids:
             if bot_id not in workers:
@@ -160,25 +176,34 @@ def supervise():
 def form(bot=None):
     bot = dict(bot) if bot else {}
     identity = bot.get("id", "")
-    username = html.escape(bot.get("username", "添加 Bot"))
+    username = html.escape(bot.get("username", "添加机器人"))
+    group = bot.get("support_group") or ""
     agents = ", ".join(map(str, json.loads(bot.get("agents", "[]"))))
     welcome = html.escape(bot.get("welcome", WELCOME))
     checked = "checked" if bot.get("enabled", True) else ""
     hint = "留空保留现有 Token" if identity else "从 @BotFather 获取"
     required = "" if identity else "required"
-    return f"""<section><h2>{username}</h2><form method="post" action="/">
+    state = "待绑定" if identity and not group else ("已启用" if checked else "已停用")
+    badge = f'<span class="state">{state}</span>' if identity else ""
+    return f"""<section id="{'new-bot' if not identity else 'bot-' + str(identity)}">
+    <div class="card-title"><h2>{username}</h2>{badge}</div><form method="post" action="/">
     <input type="hidden" name="csrf" value="{CSRF}">
     <input type="hidden" name="id" value="{identity}">
     <label>Bot Token<input type="password" name="token" autocomplete="new-password" placeholder="{hint}" {required}></label>
-    <label>客服 Telegram 数字 ID（可用逗号或空格分隔）<input name="agents" value="{agents}" required></label>
+    <label>客服超级群 ID<input name="group" value="{group}" placeholder="-100…" required></label>
+    <label>客服用户 ID<input name="agents" value="{agents}" placeholder="多个 ID 用逗号或空格分隔" required></label>
     <label>客户欢迎语<textarea name="welcome" maxlength="4096" required>{welcome}</textarea></label>
     <label class="check"><input type="checkbox" name="enabled" {checked}>启用</label>
-    <button>保存</button></form></section>"""
+    <button>{'保存设置' if identity else '添加机器人'}</button></form></section>"""
 
 
 def save(fields):
     bot_id = int(fields.get("id") or 0)
     token = fields.get("token", "").strip()
+    group = fields.get("group", "").strip()
+    if not re.fullmatch(r"-100[0-9]{5,13}", group):
+        raise ValueError("请填写以 -100 开头的超级群数字 ID。")
+    group = int(group)
     agents = re.split(r"[,，\s]+", fields.get("agents", "").strip())
     if not agents or any(not re.fullmatch(r"[1-9][0-9]{0,15}", agent) for agent in agents):
         raise ValueError("请填写客服的 Telegram 数字 ID。")
@@ -204,16 +229,27 @@ def save(fields):
     else:
         info = api(token, "getMe")
         username = "@" + info["username"]
-    if "enabled" in fields and (not old or not old["enabled"] or token != old["token"]):
+    if "enabled" in fields:
         if api(token, "getWebhookInfo").get("url"):
             raise ValueError("该 Bot 已设置 Webhook，请先在原服务中停用并移除 Webhook。")
+        try:
+            chat = api(token, "getChat", chat_id=group)
+            membership = api(token, "getChatMember", chat_id=group, user_id=identity)
+        except TelegramError:
+            raise ValueError("无法访问该超级群，请检查群 ID 并先将机器人添加到群中。") from None
+        if chat.get("type") != "supergroup" or not chat.get("is_forum"):
+            raise ValueError("请在指定超级群开启话题功能。")
+        if membership.get("status") != "administrator" or not membership.get("can_manage_topics"):
+            raise ValueError("请将机器人设为超级群管理员，并授予管理话题权限。")
     with db() as conn:
         conn.execute("""
-            INSERT INTO bots (id, token, username, agents, welcome, enabled) VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO bots (id, token, username, agents, welcome, enabled, support_group)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET token=excluded.token, username=excluded.username,
-                agents=excluded.agents, welcome=excluded.welcome, enabled=excluded.enabled
+                agents=excluded.agents, welcome=excluded.welcome, enabled=excluded.enabled,
+                support_group=excluded.support_group
         """, (identity, token, username, json.dumps(sorted(set(map(int, agents)))),
-              welcome, int("enabled" in fields)))
+              welcome, int("enabled" in fields), group))
 
 
 class Admin(BaseHTTPRequestHandler):
@@ -229,19 +265,30 @@ class Admin(BaseHTTPRequestHandler):
 
     def page(self, notice="", status=200):
         with db() as conn:
-            cards = "".join(form(row) for row in conn.execute("SELECT * FROM bots ORDER BY id"))
+            bots = conn.execute("SELECT * FROM bots ORDER BY id").fetchall()
+        cards = "".join(form(row) for row in bots)
+        active = sum(bool(row["enabled"] and row["support_group"]) for row in bots)
         body = f"""<!doctype html><html lang="zh-CN"><meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <title>Telegram 客服管理</title><style>
-        body{{max-width:900px;margin:40px auto;padding:0 20px;background:#f1f5f9;color:#132238;font:16px system-ui}}
-        section{{background:white;border:1px solid #dce5ef;border-radius:12px;padding:22px;margin:16px 0}}
-        h2{{margin-top:0}} label{{display:block;margin:12px 0}}
-        input:not([type=checkbox]),textarea{{display:block;width:100%;box-sizing:border-box;padding:9px;margin-top:6px;border:1px solid #9cabc0;border-radius:6px;font:inherit}}
-        button{{background:#164bad;color:white;border:0;border-radius:6px;padding:9px 22px;font:inherit;cursor:pointer}}
-        </style><main><h1>Telegram 客服管理</h1>
-        <p>客服先在 Telegram 打开对应 Bot 并发送 /start，再用「回复」处理收到的客户消息。</p>
+        *{{box-sizing:border-box}} body{{margin:0;background:#f5f7fb;color:#192945;font:15px system-ui,sans-serif}}
+        header{{background:#101e38;color:#fff}} .wrap{{max-width:1140px;margin:auto;padding:28px 24px}}
+        header .wrap,.card-title,.toolbar{{display:flex;align-items:center;justify-content:space-between;gap:16px}}
+        h1{{font-size:28px;margin:0}} h2{{font-size:18px;margin:0}} p{{line-height:1.6}}
+        header p{{margin:6px 0 0;color:#c7d7f1}} .toolbar{{margin:6px 0 20px}}
+        .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,340px),1fr));gap:20px;align-items:start}}
+        section{{background:#fff;border:1px solid #dbe4f1;border-radius:16px;padding:22px;box-shadow:0 5px 20px #1627450a}}
+        #new-bot{{border-top:3px solid #1755ca}} .state{{background:#eaf0ff;color:#22498c;border-radius:24px;padding:5px 10px;white-space:nowrap}}
+        label{{display:block;margin:16px 0;color:#34435d;font-weight:600}} .check{{display:flex;align-items:center;gap:8px}}
+        input:not([type=checkbox]),textarea{{display:block;width:100%;padding:10px;margin-top:6px;border:1px solid #b5c3d8;border-radius:8px;font:inherit;font-weight:400}}
+        textarea{{min-height:76px;resize:vertical}} button,.primary{{background:#1954c5;color:#fff;border:0;border-radius:8px;padding:10px 17px;font:inherit;text-decoration:none;cursor:pointer}}
+        :focus-visible{{outline:3px solid #548aff;outline-offset:3px}} [role=status]{{background:#eaf0ff;padding:12px;border-radius:8px}}
+        </style><header><div class="wrap"><div><h1>Telegram 客服管理</h1>
+        <p>将客户私聊接入客服超级群</p></div><a class="primary" href="#new-bot">添加机器人</a></div></header>
+        <main class="wrap"><div class="toolbar"><h2>机器人列表</h2><span>{len(bots)} 个机器人 · {active} 个已启用</span></div>
+        <p>开启超级群的话题功能，并授予机器人管理话题权限。客服在客户专属话题中发送消息即可回复客户。</p>
         {f'<p role="status">{html.escape(notice)}</p>' if notice else ''}
-        {cards}{form()}</main></html>""".encode()
+        <div class="grid">{cards}{form()}</div></main></html>""".encode()
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -297,12 +344,13 @@ def main():
     os.umask(0o077)
     logging.basicConfig(level=logging.INFO)
     password = os.environ["ADMIN_PASSWORD"]
-    if len(password) < 16:
-        raise SystemExit("ADMIN_PASSWORD must contain at least 16 characters")
+    username = os.environ.get("ADMIN_USERNAME", "admin")
+    if len(password) < 8:
+        raise SystemExit("ADMIN_PASSWORD must contain at least 8 characters")
     init()
     bind_host = os.environ.get("BIND_HOST", "127.0.0.1")
     server = ThreadingHTTPServer((bind_host, int(os.environ.get("PORT", "8765"))), Admin)
-    server.credentials = b"Basic " + base64.b64encode(f"admin:{password}".encode())
+    server.credentials = b"Basic " + base64.b64encode(f"{username}:{password}".encode())
     threading.Thread(target=supervise, daemon=True).start()
     server.serve_forever()
 

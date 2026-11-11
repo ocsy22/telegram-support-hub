@@ -1,32 +1,27 @@
-# Telegram 多 Bot 客服后台
+# Telegram 超级群客服后台
 
-一个网页后台管理多个 Telegram Bot，每个 Bot 可配置多名客服、欢迎语和启用状态。客户私聊 Bot 后，文字和常见媒体会复制给该 Bot 的所有客服。任一客服在 Telegram 内回复那条消息，Bot 会把回复发回对应客户。多位客服可以同时回复同一个客户。
+一个后台可添加多台机器人。每个 Bot 独立配置 Token、客服超级群、客服名单和欢迎语。同一个超级群可以接入多个 Bot，后台按 Bot 和话题识别客户。
+
+客户私聊 Bot 后，Bot 在超级群中创建独立话题，后续消息进入同一话题。配置名单中的客服在话题里发消息即可回复客户。支持文字和常见附件。
 
 ## Ubuntu 一键部署
 
-使用支持 systemd 的 Ubuntu。通过公网 IPv4 访问时，放行 TCP 8765。HTTP 会明文传输管理员密码和 Bot Token，请将 8765 的入站来源限制为管理端 IP。使用域名时，先把 DNS 记录指向 VPS 并放行 TCP 80 和 443，Caddy 会自动申请 HTTPS 证书。
-
-在 Ubuntu 的 root 终端粘贴这一条命令：
+在支持 systemd 的 Ubuntu root 终端运行：
 
 ```bash
-wget -qO /tmp/telegram-support-deploy.sh https://raw.githubusercontent.com/ocsy22/telegram-support-hub/main/deploy.sh && bash /tmp/telegram-support-deploy.sh
+setup=$(mktemp) && wget -O "$setup" https://raw.githubusercontent.com/ocsy22/telegram-support-hub/main/deploy.sh && bash "$setup"
 ```
 
-按提示填写 VPS 公网 IPv4 或后台域名。IPv4 模式会输出 `http://公网IP:8765/`。也可以在命令末尾指定域名，例如 `bash /tmp/telegram-support-deploy.sh support.example.com`。部署检查通过后，终端会输出后台地址、用户名 `admin` 和密码。重复部署会保留现有数据库和密码。
+输入 VPS 公网 IPv4 或后台域名。首次部署时自设管理员用户名和密码。安装完成后终端打印后台地址和用户名。IPv4 模式使用 TCP 8765，请在服务器防火墙和云安全组放行管理端 IP。HTTP 不加密登录信息和 Bot Token。域名模式使用 HTTPS，要求域名解析到 VPS 且公网可访问 TCP 80 和 443。
 
-若 VPS 已有站点，请确认 Caddy 可以监听 80 和 443，且后台域名未被其他站点占用。已有反向代理的服务器也可运行 `sudo bash install.sh`，然后将该域名的 HTTPS 流量转发至 `127.0.0.1:8765`。
+升级已有安装并重新设置后台账号时，在命令末尾给脚本传入公网 IP 和 `--configure-admin`。已有机器人的 Token 和欢迎语会保留。在后台为每个已有 Bot 填写客服超级群并保存，轮询才会恢复。
 
-## 配置 Bot 和客服
+## 接入客服超级群
 
-1. 在 @BotFather 创建 Bot，把 Token 填入网页后台。
-2. 填写客服的 Telegram 数字用户 ID，用逗号或空格隔开。每位客服要先打开对应 Bot 并发送 `/start`。
-3. 从另一个 Telegram 账号给 Bot 发消息，客服使用 Telegram 的「回复」功能回复收到的客户消息。
-4. 配置其他 Bot 时，重复添加流程。已有 Bot 可编辑名单、欢迎语或停用，Token 留空可保留原值。
+1. 在 Telegram 创建超级群并开启「话题」。把机器人设为管理员，授予「管理话题」权限。
+2. 登录后台，点击「添加机器人」。输入从 BotFather 获取的 Token、以 `-100` 开头的超级群数字 ID，以及客服的 Telegram 数字用户 ID。多个客服 ID 用逗号或空格分隔。
+3. 用客户账号给 Bot 发消息。进入群中生成的客户话题，用配置名单里的客服账号发消息，客户会在私聊中收到回复。
+4. 再次点击「添加机器人」可接入下一个 Bot。迁移已有 Bot 时，先停用旧轮询实例或移除旧 Webhook。
 
-本服务使用长轮询。迁移已有 Bot 时，先停止原来的轮询程序或在旧服务中移除 Webhook。每个 Token 只运行一份轮询实例。
+服务日志可通过 `journalctl -u telegram-support-hub -f` 查看。SQLite 数据存放在 `/var/lib/telegram-support-hub/`，管理员配置存放在 `/etc/telegram-support-hub/service.env`。
 
-## 数据和排查
-
-- 服务日志：`sudo journalctl -u telegram-support-hub -f`
-- Bot Token 和回复路由存放在服务器本机 SQLite 数据库 `/var/lib/telegram-support-hub/support.sqlite3`。备份时请保护数据库和环境配置文件。
-- Telegram 通信失败时服务会重试轮询。若进程在发送消息后、保存更新进度前退出，重启后可能重复投递该条消息。
