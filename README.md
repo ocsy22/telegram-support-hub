@@ -23,5 +23,14 @@ setup=$(mktemp) && wget -O "$setup" https://raw.githubusercontent.com/ocsy22/tel
 3. 用客户账号给 Bot 发消息。进入群中生成的客户话题，用配置名单里的客服账号发消息，客户会在私聊中收到回复。
 4. 再次点击「添加机器人」可接入下一个 Bot。迁移已有 Bot 时，先停用旧轮询实例或移除旧 Webhook。
 
-服务日志可通过 `journalctl -u telegram-support-hub -f` 查看。SQLite 数据存放在 `/var/lib/telegram-support-hub/`，管理员配置存放在 `/etc/telegram-support-hub/service.env`。
+## 状态与排查
+
+- 在「机器人管理」为每套配置保存备注，并查看最近轮询时间和连接状态。
+- 在「运行日志」按机器人筛选。日志会记录消息转入话题、客服回复、名单或发言身份不匹配，以及 Telegram 请求失败。每个机器人保留最近 500 条，时间使用 UTC。
+- 若第二套客服收得到消息但客户收不到回复，以个人身份在对应话题发送一条测试消息，然后查看该 Bot 的日志。若没有对应事件，检查该 Bot 是否仍是客服群管理员，以及其 Token 是否在其他服务器上运行。
+- 系统日志可通过 `journalctl -u telegram-support-hub -f` 查看。
+
+## 换服务器部署
+
+在新 Ubuntu 服务器运行同一条安装命令，输入新服务器公网 IP 或域名，再自设后台账号。若需要迁移已有配置和话题映射，先停止旧机服务，再备份旧机的 `/var/lib/telegram-support-hub/support.sqlite3`。将数据库恢复到新机的同一路径时，请先停掉新机服务，并保留目标文件的权限与属主。原机器人与超级群无需改动，恢复后启动新机服务即可。
 

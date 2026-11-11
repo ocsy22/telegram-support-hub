@@ -10,8 +10,10 @@ import sqlite3
 import threading
 import time
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qs, urlsplit
 from urllib.request import Request, urlopen
 
 DATA = os.environ.get("DB_PATH", "support.sqlite3")
@@ -19,6 +21,7 @@ TOKEN_PATTERN = re.compile(r"([1-9][0-9]{4,15}):[A-Za-z0-9_-]{20,100}")
 CSRF = secrets.token_urlsafe(32)
 WELCOME = "您好，请直接发送您的问题，客服会在这里回复您。"
 FORMAT = {"text", "photo", "video", "document", "audio", "voice", "animation", "sticker", "video_note", "contact", "location"}
+POLL_STATE = {}
 
 
 @contextmanager
@@ -45,11 +48,35 @@ def init():
                 thread INTEGER NOT NULL,
                 PRIMARY KEY (bot, chat, customer), UNIQUE (bot, chat, thread)
             );
+            CREATE TABLE IF NOT EXISTS relay_messages (
+                bot INTEGER NOT NULL, chat INTEGER NOT NULL, message INTEGER NOT NULL,
+                thread INTEGER NOT NULL, PRIMARY KEY (bot, chat, message)
+            );
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY, bot INTEGER NOT NULL, at TEXT NOT NULL,
+                level TEXT NOT NULL, detail TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS events_bot_id ON events(bot, id DESC);
         """)
         conn.execute("BEGIN IMMEDIATE")
         columns = {column["name"] for column in conn.execute("PRAGMA table_info(bots)")}
         if "support_group" not in columns:
             conn.execute("ALTER TABLE bots ADD COLUMN support_group INTEGER")
+        if "note" not in columns:
+            conn.execute("ALTER TABLE bots ADD COLUMN note TEXT NOT NULL DEFAULT ''")
+
+
+def timestamp():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def event(bot, detail, level="信息"):
+    with db() as conn:
+        conn.execute("INSERT INTO events(bot, at, level, detail) VALUES (?, ?, ?, ?)",
+                     (bot, timestamp(), level, detail))
+        conn.execute("""DELETE FROM events WHERE bot=? AND id < (
+            SELECT id FROM events WHERE bot=? ORDER BY id DESC LIMIT 1 OFFSET 499
+        )""", (bot, bot))
 
 
 class TelegramError(Exception):
@@ -64,11 +91,17 @@ def api(token, method, **data):
     try:
         with urlopen(request, timeout=35 if method == "getUpdates" else 8) as response:
             result = json.load(response)
-        if result["ok"]:
+        if result.get("ok"):
             return result["result"]
-    except Exception:
-        pass
-    raise TelegramError(method)
+    except HTTPError as exc:
+        # Never log request URLs, response bodies or Bot Tokens.
+        reason = {401: "检查 Token", 403: "检查机器人权限或客户是否屏蔽了机器人",
+                  409: "检查同一 Token 是否有其他轮询实例或 Webhook", 429: "Telegram 限流"}.get(exc.code)
+        suffix = f" · {reason}" if reason else ""
+        raise TelegramError(f"{method} HTTP {exc.code}{suffix}") from None
+    except (URLError, TimeoutError, OSError, ValueError):
+        raise TelegramError(f"{method} 网络或响应异常") from None
+    raise TelegramError(f"{method} 请求失败")
 
 
 def relay(bot, message):
@@ -98,34 +131,57 @@ def relay(bot, message):
                 with db() as conn:
                     conn.execute("INSERT INTO topics VALUES (?, ?, ?, ?)",
                                  (bot["id"], group, source, thread))
-            api(token, "copyMessage", chat_id=group, message_thread_id=thread,
-                from_chat_id=source, message_id=message["message_id"])
-        except TelegramError:
+            copied = api(token, "copyMessage", chat_id=group, message_thread_id=thread,
+                         from_chat_id=source, message_id=message["message_id"])
+            with db() as conn:
+                conn.execute("INSERT OR REPLACE INTO relay_messages VALUES (?, ?, ?, ?)",
+                             (bot["id"], group, copied["message_id"], thread))
+        except TelegramError as exc:
+            event(bot["id"], f"客户消息转入群失败 · {exc}", "错误")
             api(token, "sendMessage", chat_id=source, text="客服暂时无法接收消息，请稍后重试。")
             return
+        event(bot["id"], f"客户消息已转入话题 {thread}")
         return
 
     if chat["type"] != "supergroup" or source != group:
         return
     sender = message.get("from", {})
-    if sender.get("is_bot") or sender.get("id") not in json.loads(bot["agents"]):
+    if sender.get("is_bot") or not FORMAT.intersection(message):
         return
     thread = message.get("message_thread_id")
-    if not thread or not FORMAT.intersection(message):
-        return
+    reply = message.get("reply_to_message") or {}
     with db() as conn:
+        if not thread and reply.get("message_id"):
+            mapped = conn.execute(
+                "SELECT thread FROM relay_messages WHERE bot=? AND chat=? AND message=?",
+                (bot["id"], group, reply["message_id"]),
+            ).fetchone()
+            if mapped:
+                thread = mapped["thread"]
         route = conn.execute(
             "SELECT customer FROM topics WHERE bot=? AND chat=? AND thread=?",
             (bot["id"], group, thread),
         ).fetchone()
     if not route:
+        event(bot["id"], f"群消息未匹配客户话题 · 话题 {thread or '未提供'}", "提示")
+        return
+    if message.get("sender_chat") or sender.get("id") not in json.loads(bot["agents"]):
+        reason = "请切换为个人身份发言" if message.get("sender_chat") else f"发送者 ID {sender.get('id', '未知')} 未在客服名单"
+        event(bot["id"], f"话题 {thread} 回复已跳过 · {reason}", "警告")
         return
     try:
-        api(token, "copyMessage", chat_id=route["customer"], from_chat_id=group,
-            message_id=message["message_id"])
-    except TelegramError:
-        api(token, "sendMessage", chat_id=group, text="回复发送失败，客户可能已屏蔽机器人。",
+        if "text" in message:
+            api(token, "sendMessage", chat_id=route["customer"], text=message["text"],
+                entities=message.get("entities", []))
+        else:
+            api(token, "copyMessage", chat_id=route["customer"], from_chat_id=group,
+                message_id=message["message_id"])
+    except TelegramError as exc:
+        event(bot["id"], f"话题 {thread} 回复发送失败 · {exc}", "错误")
+        api(token, "sendMessage", chat_id=group, text="回复发送失败，请在后台查看该机器人的日志。",
             reply_parameters={"message_id": message["message_id"]})
+        return
+    event(bot["id"], f"话题 {thread} 回复已发送")
 
 
 def get_bot(bot_id):
@@ -136,11 +192,15 @@ def get_bot(bot_id):
 def poll(bot_id):
     while True:
         bot = get_bot(bot_id)
-        if not bot or not bot["enabled"]:
+        if not bot or not bot["enabled"] or not bot["support_group"]:
+            POLL_STATE.pop(bot_id, None)
             return
         try:
             updates = api(bot["token"], "getUpdates", timeout=25, limit=20,
                           offset=bot["offset"], allowed_updates=["message"])
+            if POLL_STATE.get(bot_id, ("", ""))[0] != "运行中":
+                event(bot_id, "Telegram 轮询已连接")
+            POLL_STATE[bot_id] = ("运行中", timestamp())
             for update in updates:
                 current = get_bot(bot_id)
                 if not current or not current["enabled"] or current["token"] != bot["token"]:
@@ -149,12 +209,15 @@ def poll(bot_id):
                     if "message" in update:
                         relay(current, update["message"])
                 except TelegramError as exc:
-                    logging.warning("Bot %s message action failed (%s)", bot_id, exc)
+                    event(bot_id, f"消息处理失败 · {exc}", "错误")
                 with db() as conn:
                     conn.execute("UPDATE bots SET offset=? WHERE id=? AND token=?",
                                  (update["update_id"] + 1, bot_id, bot["token"]))
-        except TelegramError:
-            logging.warning("Bot %s polling failed", bot_id)
+        except TelegramError as exc:
+            status = f"重试中 · {exc}"
+            if POLL_STATE.get(bot_id, ("", ""))[0] != status:
+                event(bot_id, f"轮询失败 · {exc}", "错误")
+            POLL_STATE[bot_id] = (status, timestamp())
             time.sleep(5)
 
 
@@ -178,17 +241,21 @@ def form(bot=None):
     identity = bot.get("id", "")
     username = html.escape(bot.get("username", "添加机器人"))
     group = bot.get("support_group") or ""
+    note = html.escape(bot.get("note", ""))
     agents = ", ".join(map(str, json.loads(bot.get("agents", "[]"))))
     welcome = html.escape(bot.get("welcome", WELCOME))
     checked = "checked" if bot.get("enabled", True) else ""
     hint = "留空保留现有 Token" if identity else "从 @BotFather 获取"
     required = "" if identity else "required"
-    state = "待绑定" if identity and not group else ("已启用" if checked else "已停用")
-    badge = f'<span class="state">{state}</span>' if identity else ""
+    state, last = POLL_STATE.get(identity, ("连接中", ""))
+    state = "待绑定" if not group else (state if checked else "已停用")
+    badge = f'<span class="state">{html.escape(state)}</span>' if identity else ""
+    detail = f'<p>最近轮询 · {html.escape(last or "—")} <a href="/logs?bot={identity}">查看日志</a></p>' if identity else ""
     return f"""<section id="{'new-bot' if not identity else 'bot-' + str(identity)}">
-    <div class="card-title"><h2>{username}</h2>{badge}</div><form method="post" action="/">
+    <div class="card-title"><h2>{username}</h2>{badge}</div>{detail}<form method="post" action="/">
     <input type="hidden" name="csrf" value="{CSRF}">
     <input type="hidden" name="id" value="{identity}">
+    <label>备注<input name="note" value="{note}" maxlength="160" placeholder="例如 港区售后"></label>
     <label>Bot Token<input type="password" name="token" autocomplete="new-password" placeholder="{hint}" {required}></label>
     <label>客服超级群 ID<input name="group" value="{group}" placeholder="-100…" required></label>
     <label>客服用户 ID<input name="agents" value="{agents}" placeholder="多个 ID 用逗号或空格分隔" required></label>
@@ -200,6 +267,9 @@ def form(bot=None):
 def save(fields):
     bot_id = int(fields.get("id") or 0)
     token = fields.get("token", "").strip()
+    note = fields.get("note", "").strip()
+    if len(note) > 160:
+        raise ValueError("备注最多 160 个字符。")
     group = fields.get("group", "").strip()
     if not re.fullmatch(r"-100[0-9]{5,13}", group):
         raise ValueError("请填写以 -100 开头的超级群数字 ID。")
@@ -243,13 +313,14 @@ def save(fields):
             raise ValueError("请将机器人设为超级群管理员，并授予管理话题权限。")
     with db() as conn:
         conn.execute("""
-            INSERT INTO bots (id, token, username, agents, welcome, enabled, support_group)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO bots (id, token, username, agents, welcome, enabled, support_group, note)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET token=excluded.token, username=excluded.username,
                 agents=excluded.agents, welcome=excluded.welcome, enabled=excluded.enabled,
-                support_group=excluded.support_group
+                support_group=excluded.support_group, note=excluded.note
         """, (identity, token, username, json.dumps(sorted(set(map(int, agents)))),
-              welcome, int("enabled" in fields), group))
+              welcome, int("enabled" in fields), group, note))
+    event(identity, "机器人配置已保存")
 
 
 class Admin(BaseHTTPRequestHandler):
@@ -263,19 +334,55 @@ class Admin(BaseHTTPRequestHandler):
         self.end_headers()
         return False
 
-    def page(self, notice="", status=200):
+    def page(self, notice="", status=200, module="bots", bot_filter=None):
         with db() as conn:
             bots = conn.execute("SELECT * FROM bots ORDER BY id").fetchall()
-        cards = "".join(form(row) for row in bots)
-        active = sum(bool(row["enabled"] and row["support_group"]) for row in bots)
+            logs = conn.execute("""
+                SELECT e.*, b.username, b.note FROM events e JOIN bots b ON b.id=e.bot
+                WHERE (? IS NULL OR e.bot=?) ORDER BY e.id DESC LIMIT 200
+            """, (bot_filter, bot_filter)).fetchall() if module == "logs" else []
+        if module == "logs":
+            filters = '<a href="/logs">全部</a>' + "".join(
+                f'<a href="/logs?bot={row["id"]}" {"aria-current=page" if bot_filter == row["id"] else ""}>'
+                f'{html.escape(row["note"] or row["username"])}</a>' for row in bots
+            )
+            rows = "".join(
+                f'<tr><td>{html.escape(row["at"])}</td><td>{html.escape(row["note"] or row["username"])}</td>'
+                f'<td>{html.escape(row["level"])}</td><td>{html.escape(row["detail"])}</td></tr>'
+                for row in logs
+            ) or '<tr><td colspan="4">暂无日志</td></tr>'
+            content = f"""<h1>运行日志</h1><p>时间使用 UTC。刷新页面可查看最新记录。</p>
+            <nav class="filters" aria-label="筛选机器人">{filters}</nav>
+            <section class="log-table"><table><thead><tr><th>时间</th><th>机器人</th>
+            <th>级别</th><th>事件</th></tr></thead><tbody>{rows}</tbody></table></section>"""
+        else:
+            cards = "".join(form(row) for row in bots)
+            active = sum(row["enabled"] and POLL_STATE.get(row["id"], ("", ""))[0] == "运行中" for row in bots)
+            content = f"""<div class="toolbar"><div><h1>机器人管理</h1>
+            <p>{len(bots)} 个机器人 · {active} 个已连接</p></div>
+            <a class="primary" href="#new-bot">添加机器人</a></div>
+            <p>客服在客户专属话题中发送消息即可回复客户。</p>
+            <div class="grid">{cards}{form()}</div>"""
         body = f"""<!doctype html><html lang="zh-CN"><meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
         <title>Telegram 客服管理</title><style>
         *{{box-sizing:border-box}} body{{margin:0;background:#f5f7fb;color:#192945;font:15px system-ui,sans-serif}}
-        header{{background:#101e38;color:#fff}} .wrap{{max-width:1140px;margin:auto;padding:28px 24px}}
-        header .wrap,.card-title,.toolbar{{display:flex;align-items:center;justify-content:space-between;gap:16px}}
+        .layout{{display:grid;grid-template-columns:220px minmax(0,1fr);min-height:100vh}}
+        aside{{background:#101e38;color:#fff;padding:26px 18px}}
+        aside strong{{display:block;padding:0 10px;margin-bottom:22px;font-size:18px}}
+        aside a{{display:block;padding:11px 12px;border-radius:8px;color:#dbe8fc;text-decoration:none}}
+        aside a:hover,aside [aria-current]{{background:#243e69;color:#fff}}
+        .wrap{{width:100%;max-width:1280px;margin:0 auto;padding:32px 26px}}
+        .card-title,.toolbar{{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}}
         h1{{font-size:28px;margin:0}} h2{{font-size:18px;margin:0}} p{{line-height:1.6}}
-        header p{{margin:6px 0 0;color:#c7d7f1}} .toolbar{{margin:6px 0 20px}}
+        .toolbar p{{margin:6px 0 0;color:#51617a}} .toolbar{{margin:6px 0 20px}}
+        .filters{{display:flex;gap:8px;flex-wrap:wrap;margin:16px 0}}
+        .filters a{{padding:6px 12px;background:#eaf0ff;border-radius:8px;color:#22498c;text-decoration:none}}
+        .filters [aria-current]{{background:#1954c5;color:#fff}}
+        .log-table{{overflow:auto}} table{{width:100%;border-collapse:collapse}}
+        th,td{{text-align:left;padding:12px;border-bottom:1px solid #dbe4f1}} th{{white-space:nowrap}}
+        @media(max-width:700px){{.layout{{display:block}} aside{{padding:16px}} aside strong{{margin-bottom:8px}}
+        aside nav{{display:flex;flex-wrap:wrap}} .wrap{{padding:22px 16px}}}}
         .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(100%,340px),1fr));gap:20px;align-items:start}}
         section{{background:#fff;border:1px solid #dbe4f1;border-radius:16px;padding:22px;box-shadow:0 5px 20px #1627450a}}
         #new-bot{{border-top:3px solid #1755ca}} .state{{background:#eaf0ff;color:#22498c;border-radius:24px;padding:5px 10px;white-space:nowrap}}
@@ -283,12 +390,12 @@ class Admin(BaseHTTPRequestHandler):
         input:not([type=checkbox]),textarea{{display:block;width:100%;padding:10px;margin-top:6px;border:1px solid #b5c3d8;border-radius:8px;font:inherit;font-weight:400}}
         textarea{{min-height:76px;resize:vertical}} button,.primary{{background:#1954c5;color:#fff;border:0;border-radius:8px;padding:10px 17px;font:inherit;text-decoration:none;cursor:pointer}}
         :focus-visible{{outline:3px solid #548aff;outline-offset:3px}} [role=status]{{background:#eaf0ff;padding:12px;border-radius:8px}}
-        </style><header><div class="wrap"><div><h1>Telegram 客服管理</h1>
-        <p>将客户私聊接入客服超级群</p></div><a class="primary" href="#new-bot">添加机器人</a></div></header>
-        <main class="wrap"><div class="toolbar"><h2>机器人列表</h2><span>{len(bots)} 个机器人 · {active} 个已启用</span></div>
-        <p>开启超级群的话题功能，并授予机器人管理话题权限。客服在客户专属话题中发送消息即可回复客户。</p>
+        </style><div class="layout"><aside><strong>Telegram 客服</strong><nav aria-label="后台模块">
+        <a href="/" {"aria-current=page" if module == "bots" else ""}>机器人管理</a>
+        <a href="/logs" {"aria-current=page" if module == "logs" else ""}>运行日志</a>
+        </nav></aside><main class="wrap">
         {f'<p role="status">{html.escape(notice)}</p>' if notice else ''}
-        <div class="grid">{cards}{form()}</div></main></html>""".encode()
+        {content}</main></div></html>""".encode()
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -299,8 +406,15 @@ class Admin(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.authenticated():
-            if self.path in ("/", "/?saved"):
-                self.page("已保存。" if self.path == "/?saved" else "")
+            url = urlsplit(self.path)
+            if url.path == "/":
+                self.page("已保存。" if url.query == "saved" else "")
+            elif url.path == "/logs":
+                bot = parse_qs(url.query).get("bot", [""])[0]
+                if bot and not re.fullmatch(r"[1-9][0-9]{0,15}", bot):
+                    self.send_error(400)
+                    return
+                self.page(module="logs", bot_filter=int(bot) if bot else None)
             else:
                 self.send_error(404)
 
